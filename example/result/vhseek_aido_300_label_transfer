@@ -1,0 +1,45 @@
+[Escherichia phage HeinrichReichert][infraspecies]
+Escherichia coli K-12	0.750
+Escherichia coli O177	0.063
+Escherichia coli O157:H7	0.024
+Escherichia coli str. K-12 substr. MG1655	0.020
+[Escherichia phage HeinrichReichert][species]
+Escherichia coli	0.960
+[Escherichia phage HeinrichReichert][genus]
+Escherichia	0.995
+[Escherichia phage HeinrichReichert][family]
+Enterobacteriaceae	0.998
+[Escherichia phage HeinrichReichert][order]
+Enterobacterales	1.000
+[Escherichia phage HeinrichReichert][class]
+Gammaproteobacteria	1.000
+[Escherichia phage HeinrichReichert][phylum]
+Pseudomonadota	1.000
+[Norovirus Hu/GII.4/Hong Kong/CUHK6080/2012/CHN][species]
+Homo sapiens	1.000
+[Norovirus Hu/GII.4/Hong Kong/CUHK6080/2012/CHN][genus]
+Homo	1.000
+[Norovirus Hu/GII.4/Hong Kong/CUHK6080/2012/CHN][family]
+Hominidae	1.000
+[Norovirus Hu/GII.4/Hong Kong/CUHK6080/2012/CHN][order]
+Primates	1.000
+[Norovirus Hu/GII.4/Hong Kong/CUHK6080/2012/CHN][class]
+Mammalia	1.000
+[Norovirus Hu/GII.4/Hong Kong/CUHK6080/2012/CHN][phylum]
+Chordata	1.000
+[Lake Victoria marburgvirus - DRC1999][species]
+Rousettus aegyptiacus	0.992
+Homo sapiens	0.867
+[Lake Victoria marburgvirus - DRC1999][genus]
+Rousettus	0.992
+Homo	0.868
+[Lake Victoria marburgvirus - DRC1999][family]
+Pteropodidae	0.992
+Hominidae	0.930
+[Lake Victoria marburgvirus - DRC1999][order]
+Chiroptera	0.992
+Primates	0.978
+[Lake Victoria marburgvirus - DRC1999][class]
+Mammalia	1.000
+[Lake Victoria marburgvirus - DRC1999][phylum]
+Chordata	1.000

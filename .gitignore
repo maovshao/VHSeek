@@ -1,0 +1,17 @@
+# Folders #
+###########
+**/__pycache__/
+**/.ipynb_checkpoints/
+.vscode/
+vhseek_data/
+zto_remove/
+scripts/
+wandb/
+paper/
+experiment.py
+experiment.ipynb
+example.py
+
+# Junk #
+########
+.DS_Store*

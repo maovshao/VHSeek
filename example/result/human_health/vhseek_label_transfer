@@ -1,0 +1,33 @@
+[Saboya virus][species]
+Homo sapiens	0.928
+[Saboya virus][genus]
+Homo	0.928
+[Saboya virus][family]
+Hominidae	0.928
+Culicidae	0.852
+[Saboya virus][order]
+Rodentia	0.953
+Primates	0.928
+Diptera	0.890
+[Saboya virus][class]
+Mammalia	0.994
+Insecta	0.890
+[Saboya virus][phylum]
+Chordata	0.994
+Arthropoda	0.890
+[Lake Victoria marburgvirus - DRC1999][species]
+Rousettus aegyptiacus	0.984
+Homo sapiens	0.935
+[Lake Victoria marburgvirus - DRC1999][genus]
+Rousettus	0.984
+Homo	0.936
+[Lake Victoria marburgvirus - DRC1999][family]
+Pteropodidae	0.984
+Hominidae	0.936
+[Lake Victoria marburgvirus - DRC1999][order]
+Primates	0.989
+Chiroptera	0.984
+[Lake Victoria marburgvirus - DRC1999][class]
+Mammalia	0.999
+[Lake Victoria marburgvirus - DRC1999][phylum]
+Chordata	1.000
