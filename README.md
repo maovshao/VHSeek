@@ -12,7 +12,6 @@ VHSeek combines `DNA and Protein Foundation Models` to build `Multimodal Virus E
 * [Data preparation](#data-preparation)
 * [Reproduce all our experiments with only one file](#main)
 * [Run VHSeek locally](#pipeline)
-* [Citation](#citation)
 
 ## Requirements
 
@@ -28,7 +27,7 @@ VHSeek combines `DNA and Protein Foundation Models` to build `Multimodal Virus E
 ## Data preparation
 <span id="data-preparation"></span>
 
-We have released our experiment data, which can be downloaded from [Zenodo](https://zenodo.org/records/14728501).
+We have released our experiment data, which can be downloaded from [Zenodo](https://zenodo.org/records/18718270).
 
 ## Reproduce all our experiments with only one file
 <span id="main"></span>
