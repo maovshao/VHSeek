@@ -35,6 +35,17 @@ def chunk_sequence(seq: str, max_len: int) -> List[str]:
     """Return non‑overlapping chunks of length ≤ max_len."""
     return [seq[i:i + max_len] for i in range(0, len(seq), max_len)]
 
+class LastHiddenStateModel(torch.nn.Module):
+    """Return hidden states as a tensor across modelgenerator API versions."""
+
+    def __init__(self, embed_model: torch.nn.Module):
+        super().__init__()
+        self.embed_model = embed_model
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        output = self.embed_model(batch)
+        return output.last_hidden_state if hasattr(output, "last_hidden_state") else output
+
 # --------------------------------------------------------------------------- #
 # Main routine
 # --------------------------------------------------------------------------- #
@@ -66,7 +77,8 @@ def aido_embedding_generate(fasta: Path,
     # 3. Load model (use aido_dna_300m backbone)
     logger.info("Loading aido_300M backbone …")
     base_model = Embed.from_config({"model.backbone": "aido_dna_300m"}).eval().to(main_device)
-    model = torch.nn.DataParallel(base_model, device_ids=device_list) if use_cuda else base_model
+    hidden_model = LastHiddenStateModel(base_model).eval().to(main_device)
+    model = torch.nn.DataParallel(hidden_model, device_ids=device_list) if use_cuda else hidden_model
 
     # 4. Batch inference
     chunk_vecs: Dict[str, List[torch.Tensor]] = {}

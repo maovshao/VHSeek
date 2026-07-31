@@ -1,6 +1,7 @@
 #conda environment
 pip install gpustat
 pip install ipykernel
+pip install nbconvert
 pip install matplotlib
 pip install pandas
 pip install biopython

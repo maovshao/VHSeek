@@ -8,20 +8,9 @@ from pathlib import Path
 from logzero import logger
 from vhseek_util.evaluation import LABEL_LEVELS, OTHER_LEVEL
 
-def get_index_protein_dic(protein_list):
-    return {index: protein for index, protein in enumerate(protein_list)}
-
-def get_protein_index_dic(protein_list):
-    return {protein: index for index, protein in enumerate(protein_list)}
-
 def make_parent_dir(path):
     filepath = Path(path)
     filepath.parent.mkdir(parents=True, exist_ok=True)
-
-def tensor_to_list(tensor):
-    decimals = 4
-    numpy_array = tensor.cpu().numpy()
-    return np.round(numpy_array, decimals=decimals).tolist()
 
 def load_config(config_path):
     """

@@ -139,7 +139,7 @@ def build_prediction_taxonomy(
             tx_path = label_taxonomy.get(host, {})
             for lv in STAT_LEVELS:
                 tx = tx_path.get(lv)
-                if tx and prob > pr_tx_tmp[vid][lv].get(tx, 0.0):
+                if tx and (tx not in pr_tx_tmp[vid][lv] or prob > pr_tx_tmp[vid][lv][tx]):
                     pr_tx_tmp[vid][lv][tx] = prob
 
     # Sort each taxonomy list by probability (descending)
@@ -230,15 +230,24 @@ def evaluate_metrics(
             for prob, tx in predicted_taxa_for_level:
                 if tx in taxonomy_index:
                     col = taxonomy_index[tx]
-                    score_dense[row, col] = max(score_dense[row, col], prob)
+                    # Keep explicit zero-score predictions distinguishable from
+                    # absent predictions for source methods such as CRISPR.
+                    score = prob if prob > 0 else np.nextafter(np.float32(0), np.float32(1))
+                    score_dense[row, col] = max(score_dense[row, col], score)
                 else:
                     # MODIFICATION: Conditional logging
                     if with_log:
                         logger.debug(f"Predicted taxonomy term '{tx}' for virus ID {vid} at level '{lv}' not found in taxonomy_index. Skipping this specific prediction score.")
         score_csr = ssp.csr_matrix(score_dense)
 
-        active_prediction_rows_mask = score_csr.getnnz(axis=1) > 0
-        with_prediction_rows = np.where(active_prediction_rows_mask)[0]
+        with_prediction_rows = np.array(
+            [
+                vid2row[vid]
+                for vid in valid_vids
+                if pr_tx.get(vid, {}).get(lv, [])
+            ],
+            dtype=int
+        )
 
         if a == 0: # This condition was already present in the input
             result["fmax_per_level"][lv], result["fmax_thresholds_per_level"][lv] = 0.0, 0.0

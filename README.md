@@ -1,8 +1,8 @@
 # VHSeek
 
-This repository implements "VHSeek: Biology foundation model-based multimodal virus representations revealing virus host associations".
+This repository implements "VHSeek: Biology foundation model-based virus representations revealing virus host associations".
 
-VHSeek combines `DNA and Protein Foundation Models` to build `Multimodal Virus Embeddings`, and uses these embeddings to predict `Associations between Viruses and Hosts` for all types of viruses (more than phage) and all taxonomy levels of host (from Infraspecies to Phylum).
+VHSeek combines `DNA and Protein Foundation Models` to build `Virus Embeddings`, and uses these embeddings to predict `Associations between Viruses and Hosts` for all types of viruses (more than phage) and all taxonomy levels of host (from Infraspecies to Phylum).
 
 <div align=center><img src="example/figure/VHSeek.png" width="100%" height="100%" /></div>
 
@@ -27,7 +27,7 @@ VHSeek combines `DNA and Protein Foundation Models` to build `Multimodal Virus E
 ## Data preparation
 <span id="data-preparation"></span>
 
-We have released our experiment data, which can be downloaded from [Zenodo](https://zenodo.org/records/18718270).
+Download the latest VHSeek data release from [Zenodo](https://doi.org/10.5281/zenodo.18718269). Extract `vhseek_data.zip` in the repository root so that the resulting `vhseek_data/` directory is available to `main.ipynb`.
 
 ## Reproduce all our experiments with only one file
 <span id="main"></span>
@@ -40,5 +40,6 @@ We have released our experiment data, which can be downloaded from [Zenodo](http
 <span id="pipeline"></span>
 
 - Run VHSeek locally by following the example in [pipeline.ipynb](pipeline.ipynb)
+- See the [example documentation](example/README.md) for the tested environment, quick-start steps, expected outputs, and input requirements.
 
 **Notice: the inputs and outputs of the example are saved in** `example/`.

@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import pickle
 from tqdm import tqdm
 import statistics
 import numpy as np
@@ -815,32 +816,49 @@ def major_test(
     except FileNotFoundError:
         logger.error(f"Prediction file {prediction_path} not found. Skipping evaluation for this file.")
         return {}
+
+    df_pred["score"] = pd.to_numeric(df_pred["score"], errors="coerce")
+    bad_score_rows = int(df_pred["score"].isna().sum())
+    if bad_score_rows:
+        logger.warning(f"Dropping {bad_score_rows} prediction rows with non-numeric scores for {method_name}.")
+        df_pred = df_pred.dropna(subset=["score"])
         
     # 3. Build the scores matrix
     logger.info("Building scores matrix...")
     score_rows, score_cols, score_data = [], [], []
-    # ... (rest of score matrix building logic as provided by user - unchanged) ...
-    predictions_in_master_list = 0
-    predictions_skipped_host_not_in_index = 0
-    predictions_skipped_virus_not_in_master = 0
-    for _, row in df_pred.iterrows():
+    predictions_skipped_virus_not_in_master = int((~df_pred["virus"].isin(virus_ids_index)).sum())
+    df_pred_master = df_pred[df_pred["virus"].isin(virus_ids_index)].copy()
+    predictions_skipped_host_not_in_index = int((~df_pred_master["host"].isin(label_index)).sum())
+    df_pred_valid = df_pred_master[df_pred_master["host"].isin(label_index)].copy()
+    duplicate_pair_count = int(df_pred_valid.duplicated(subset=["virus", "host"], keep=False).sum())
+    if duplicate_pair_count:
+        duplicate_group_count = int(
+            (df_pred_valid.groupby(["virus", "host"], sort=False).size() > 1).sum()
+        )
+        logger.info(
+            f"Aggregating {duplicate_pair_count} duplicate prediction rows "
+            f"({duplicate_group_count} virus-host pairs) with max(score) for {method_name}."
+        )
+        df_pred_valid = (
+            df_pred_valid
+            .groupby(["virus", "host"], as_index=False, sort=False)["score"]
+            .max()
+        )
+    predictions_in_master_list = len(df_pred_valid)
+    for _, row in df_pred_valid.iterrows():
         virus_name = row['virus']
         host_name = row['host']
-        if virus_name in virus_ids_index:
-            if host_name in label_index: 
-                score_rows.append(virus_ids_index[virus_name])
-                score_cols.append(label_index[host_name])
-                score_data.append(row['score'])
-                predictions_in_master_list += 1
-            else:
-                predictions_skipped_host_not_in_index +=1
-        else:
-            predictions_skipped_virus_not_in_master +=1
+        score_rows.append(virus_ids_index[virus_name])
+        score_cols.append(label_index[host_name])
+        score_data.append(row['score'])
     # if predictions_skipped_host_not_in_index > 0:
     #     logger.debug(f"Skipped {predictions_skipped_host_not_in_index} predictions...")
     # if predictions_skipped_virus_not_in_master > 0:
     #     logger.warning(f"Skipped {predictions_skipped_virus_not_in_master} predictions...")
-    logger.info(f"Processed {predictions_in_master_list} valid prediction entries...")
+    logger.info(
+        f"Processed {predictions_in_master_list} valid prediction entries "
+        f"after max-aggregation of duplicate virus-host rows."
+    )
     scores_matrix = ssp.csr_matrix(
         (score_data, (score_rows, score_cols)),
         shape=(n_target_viruses, n_hosts), 
@@ -882,8 +900,148 @@ def major_test(
     
     result["method_name_raw"] = method_name
     result["virus_ids"] = virus_ids
+    result["label_taxonomy"] = label_taxonomy
 
     return result
+
+def _load_virus_host_label_file(path: str) -> Dict[str, List[str]]:
+    data: Dict[str, List[str]] = {}
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            parts = [part for part in line.rstrip("\n").split("\t") if part]
+            if parts:
+                data[parts[0]] = parts[1:]
+    return data
+
+def _taxa_for_training_labels(
+    labels: List[str],
+    label_taxonomy: Dict[str, Dict[str, str]],
+    level: str,
+) -> Set[str]:
+    taxa: Set[str] = set()
+    for label in labels:
+        taxon = label_taxonomy.get(label, {}).get(level)
+        if taxon and taxon not in {"_", "root"}:
+            taxa.add(taxon)
+    return taxa
+
+def _host_support_bin_name(
+    support: int,
+    support_bins: List[Tuple[str, Optional[int], Optional[int]]],
+) -> str:
+    for name, lower, upper in support_bins:
+        if lower is not None and support < lower:
+            continue
+        if upper is not None and support > upper:
+            continue
+        return name
+    return "NA"
+
+def host_support_stratified_cr_ir_na_table(
+    metrics_results_by_method: Dict[str, Dict],
+    train_label_path: str,
+    output_path: str,
+    dataset_name: str = "VHDB",
+    levels: Optional[List[str]] = None,
+    support_bins: Optional[List[Tuple[str, Optional[int], Optional[int]]]] = None,
+) -> pd.DataFrame:
+    """Export CR/IR/NA stratified by training support of true host taxa.
+
+    This is a table-only helper for notebook source TSV generation. It reuses
+    `major_test` outputs so the taxonomy transfer and Top-1 status definitions
+    match the main evaluation.
+    """
+    if levels is None:
+        levels = ["species", "genus", "family", "order", "class", "phylum"]
+    if support_bins is None:
+        support_bins = [
+            ("0", 0, 0),
+            ("1-10", 1, 10),
+            ("11-50", 11, 50),
+            ("51-100", 51, 100),
+            (">100", 101, None),
+        ]
+    if not metrics_results_by_method:
+        raise ValueError("metrics_results_by_method must contain at least one method result.")
+
+    first_result = next(iter(metrics_results_by_method.values()))
+    label_taxonomy = first_result.get("label_taxonomy")
+    if not label_taxonomy:
+        raise ValueError("major_test results must include label_taxonomy.")
+
+    train_labels = _load_virus_host_label_file(train_label_path)
+    train_support_by_level: Dict[str, Counter] = {}
+    for level in levels:
+        support_counts: Counter = Counter()
+        for labels in train_labels.values():
+            for taxon in _taxa_for_training_labels(labels, label_taxonomy, level):
+                support_counts[taxon] += 1
+        train_support_by_level[level] = support_counts
+
+    rows: List[Dict[str, Any]] = []
+    for method_name, metrics_results in metrics_results_by_method.items():
+        virus_ids = metrics_results.get("virus_ids", [])
+        gt_tx = metrics_results.get("gt_tx", {})
+        pr_tx = metrics_results.get("pr_tx", {})
+        if not virus_ids or not gt_tx:
+            raise ValueError(f"Missing virus_ids/gt_tx in metrics for {method_name}.")
+
+        for level in levels:
+            bin_records: Dict[str, List[Tuple[str, int]]] = {
+                bin_name: [] for bin_name, _, _ in support_bins
+            }
+            support_counts = train_support_by_level[level]
+
+            for vid, _virus in enumerate(virus_ids):
+                true_taxa = gt_tx.get(vid, {}).get(level, set())
+                true_taxa = {taxon for taxon in true_taxa if taxon and taxon not in {"_", "root"}}
+                if not true_taxa:
+                    continue
+
+                support = max([support_counts.get(taxon, 0) for taxon in true_taxa] or [0])
+                bin_name = _host_support_bin_name(support, support_bins)
+                if bin_name == "NA":
+                    continue
+
+                predicted = pr_tx.get(vid, {}).get(level, [])
+                if not predicted:
+                    status = "no_answer"
+                elif predicted[0][1] in true_taxa:
+                    status = "correct"
+                else:
+                    status = "incorrect"
+                bin_records[bin_name].append((status, support))
+
+            for bin_name, _lower, _upper in support_bins:
+                records = bin_records[bin_name]
+                status_counts = Counter(status for status, _support in records)
+                correct = int(status_counts.get("correct", 0))
+                incorrect = int(status_counts.get("incorrect", 0))
+                no_answer = int(status_counts.get("no_answer", 0))
+                total = correct + incorrect + no_answer
+                answered = correct + incorrect
+                supports = [support for _status, support in records]
+                rows.append({
+                    "dataset": dataset_name,
+                    "method": method_name,
+                    "level": level,
+                    "support_bin": bin_name,
+                    "valid_viruses": total,
+                    "correct": correct,
+                    "incorrect": incorrect,
+                    "no_answer": no_answer,
+                    "CR": correct / total if total else np.nan,
+                    "IR": incorrect / total if total else np.nan,
+                    "NA": no_answer / total if total else np.nan,
+                    "FDR": incorrect / answered if answered else np.nan,
+                    "median_train_support": statistics.median(supports) if supports else np.nan,
+                })
+
+    out_df = pd.DataFrame(rows)
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(out_path, sep="\t", index=False, float_format="%.6g", na_rep="NA")
+    return out_df
 
 def fmax_plot(
     fmax_plot_data: Dict[str, float],
@@ -905,7 +1063,7 @@ def fmax_plot(
     # Assuming method_colors contains all methods in methods_to_display from master_color_map
     # Fallback to a default color generation if a method is missing, though ideally it shouldn't happen.
     colors = []
-    cmap_fallback = plt.cm.get_cmap('tab10')
+    cmap_fallback = plt.colormaps.get_cmap('tab10')
     fallback_color_idx = 0
     for i, method_name in enumerate(methods_to_display):
         color = method_colors.get(method_name)
@@ -977,7 +1135,7 @@ def aupr_plot(
     # Define colors for the methods that will actually be plotted
     # Assuming method_colors contains all methods in methods_for_curves from master_color_map
     plot_colors = []
-    cmap_fallback = plt.cm.get_cmap('tab10')
+    cmap_fallback = plt.colormaps.get_cmap('tab10')
     fallback_color_idx = 0
     for i, method_name in enumerate(methods_for_curves):
         color = method_colors.get(method_name)
@@ -1041,7 +1199,7 @@ def plot_cina_fractions(
     x_positions = np.arange(len(methods))
 
     # Colors
-    default_palette = plt.cm.get_cmap('tab10')
+    default_palette = plt.colormaps.get_cmap('tab10')
     correct_bar_colors = []
     if method_colors:
         correct_bar_colors = [method_colors.get(method, default_palette(i % default_palette.N)) for i, method in enumerate(methods)]
@@ -1177,9 +1335,8 @@ def major_plot(
     filtered_palette = [color for i, color in enumerate(full_palette) if i not in [14, 15]][::-1]
 
     master_color_map = {key: filtered_palette[i] for i, key in enumerate(order_list)}
-    
+
     # --- Prepare data for each plot type ---
-    # (This logic remains as modified in the previous correct response)
     fmax_data_genus = {}
     aupr_data_genus = {}
     cina_data_genus = {}
@@ -1345,7 +1502,6 @@ def major_plot(
         logger.info("No data or no target methods with data for the top methods summary plot (Correct Rate).")
 
     # --- Output TSV File ---
-    # (This logic remains as modified in the previous correct response)
     print("====================================================")
     logger.info("Evaluation and plotting script finished.")
 
@@ -1956,29 +2112,36 @@ def distance_control_plot(
     filtered_palette = [c for i, c in enumerate(full_palette) if i not in (14, 15)][::-1]
     colour_map = {m: filtered_palette[i] for i, m in enumerate(full_order_list)}
 
-    # virus name list from any method result
-    sample_result = next(iter(result_dict.values()))
-    vid2name = {vid: name for vid, name in enumerate(sample_result["virus_ids"])}
-
     # ---------- compute metrics ----------
     metrics: Dict[str, Dict[float, Dict[str, float]]] = {m: {thr: {} for thr in thresholds} for m in method_order}
 
     for thr in thresholds:
-        vids_kept = {
-            vid for vid, vname in vid2name.items()
-            if virus2dist.get(vname, float("inf")) >= thr
+        kept_virus_names = {
+            vname for vname, dist in virus2dist.items()
+            if dist >= thr
         }
-        if not vids_kept:
+        if not kept_virus_names:
             logger.warning(f"[{thr}] no viruses kept; skipping.")
             continue
-        else:
-            logger.info(f"Virus with distance >= {thr}: [{len(vids_kept)}/{len(vid2name)}] ")
+        logger.info(f"Virus with distance >= {thr}: [{len(kept_virus_names)}/{len(virus2dist)}] ")
 
         for method in method_order:
             res = result_dict.get(method)
             if res is None:
                 continue
             gt_tx, pr_tx = res["gt_tx"], res["pr_tx"]
+            method_vid2name = {vid: name for vid, name in enumerate(res.get("virus_ids", []))}
+            method_name_set = set(method_vid2name.values())
+            missing_names = kept_virus_names - method_name_set
+            if missing_names:
+                logger.warning(
+                    f"[{thr}] method '{method}' is missing {len(missing_names)} "
+                    "distance-filtered viruses; evaluating matched names only."
+                )
+            vids_kept = {
+                vid for vid, vname in method_vid2name.items()
+                if vname in kept_virus_names
+            }
 
             n1 = n2 = n3 = 0
             for vid in vids_kept:
@@ -3571,41 +3734,86 @@ specific_host_wmw._default_save_prefix = 'Association_Extension_WMW'
 # ---------------------------------------------------------------------------
 # Contig-level statistics: length-stratified Top-1 performance
 # ---------------------------------------------------------------------------
-@auto_save_plots
-def contig_statistics(
+
+IMGVR_LENGTH_STRATIFIED_BINS = [0, 5000, 10000, 20000, 40000, 60000, 80000, float("inf")]
+IMGVR_LENGTH_STRATIFIED_BIN_LABELS = ["<=5kb", "5-10kb", "10-20kb", "20-40kb", "40-60kb", "60-80kb", ">80kb"]
+IMGVR_LENGTH_STRATIFIED_METHODS = {
+    "VHSeek (ESM2-650M)": "vhseek_data/experiment/test_result/img_vr/vhseek_esm2_650_probability",
+    "VHSeek (AIDO-300M)": "vhseek_data/experiment/test_result/img_vr/vhseek_aido_300_probability",
+    "VHSeek (Threshold)": "vhseek_data/experiment/test_result/img_vr/threshold/vhseek_probability",
+    "VHSeek": "vhseek_data/experiment/test_result/img_vr/vhseek_probability",
+}
+IMGVR_LENGTH_STRATIFIED_TRUTH_PATHS = {
+    "virus_test_path": "vhseek_data/data/img_vr/label_transfer/test",
+    "label_taxonomy_path": "vhseek_data/data/util/host_label/label_transfer/taxonomy",
+    "label_index_path": "vhseek_data/data/util/host_label/label_transfer/index",
+}
+
+
+def _prepare_contig_length_bins(
+    bins: Optional[List[float]] = None,
+    bin_labels: Optional[List[str]] = None,
+) -> Tuple[List[Tuple[float, float]], List[str]]:
+    """Return normalized length-bin intervals and display labels."""
+    if bins:
+        bins = list(bins)
+    else:
+        bins = [0, 10000, 20000, 40000, 60000, 80000]
+    if bins[0] > 0:
+        bins = [0.0] + bins
+
+    bin_pairs = list(zip(bins[:-1], bins[1:]))
+    if bin_labels is not None:
+        bin_labels = list(bin_labels)
+        if len(bin_labels) != len(bin_pairs):
+            raise ValueError("bin_labels must have the same length as the number of bin intervals")
+    else:
+        default_labels = [
+            "0-10000",
+            "10000-20000",
+            "20000-40000",
+            "40000-60000",
+            "60000-80000",
+        ]
+        if len(default_labels) == len(bin_pairs):
+            bin_labels = default_labels
+        else:
+            bin_labels = [
+                f"{int(lo)}-{int(hi)}" if np.isfinite(hi) else f">{int(lo)}"
+                for lo, hi in bin_pairs
+            ]
+
+    return bin_pairs, bin_labels
+
+
+def _assign_contig_length_bin(
+    length_val: int,
+    bin_pairs: List[Tuple[float, float]],
+    bin_labels: List[str],
+) -> Optional[Tuple[str, int]]:
+    for idx, (lo, hi) in enumerate(bin_pairs):
+        if idx == 0:
+            if length_val <= hi:
+                return bin_labels[idx], idx
+        elif not np.isfinite(hi):
+            if length_val > lo:
+                return bin_labels[idx], idx
+        else:
+            if lo < length_val <= hi:
+                return bin_labels[idx], idx
+    return None
+
+
+def _compute_contig_length_bin_summary(
     prediction_path: str,
     truth_paths: Dict[str, str],
     *,
     length_path: str,
     method_name: Optional[str] = None,
-    bins: Optional[List[float]] = None
+    bins: Optional[List[float]] = None,
+    bin_labels: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Summarise contig-level predictions with length-aware accuracy plots.
-
-    Parameters
-    ----------
-    prediction_path : str
-        TSV file with three columns: contig_id, host_label, score.
-    truth_path : str
-        TSV file with ground-truth host labels (deepest → broadest) per contig.
-    taxonomy_path : str
-        Host taxonomy lookup table (same format used in major_test).
-    length_path : str
-        TSV file mapping contig_id -> length (bp), one per line as
-        "{contig_id}\\t{length}".
-    method_name : str, optional
-        Label for logging/legend purposes.
-    bins : list of float, optional
-        Custom length breakpoints. If None, defaults to:
-        [0, 10000, 25000, 50000, inf].
-
-    Returns
-    -------
-    Dict[str, Any]
-        Dictionary containing per-level, per-bin aggregates consistent with
-        the Top-1 metrics used in `major_plot`.
-    """
-
+    """Compute length-stratified Top-1 Correct/Incorrect/No-answer counts."""
     if not os.path.exists(prediction_path):
         logger.error(f"Prediction file not found: {prediction_path}")
         return {}
@@ -3626,7 +3834,6 @@ def contig_statistics(
         {k: truth_paths[k] for k in sorted(truth_paths)}
     )
 
-    # Load contig lengths from the provided file
     length_map: Dict[str, int] = {}
     try:
         with open(length_path, "r") as fh:
@@ -3652,15 +3859,11 @@ def contig_statistics(
         logger.error(f"Failed to read length file {length_path}: {exc}")
         return {}
 
-    # ------------------------------------------------------------------
-    # Load GT taxonomy (label transfer) and Top-1 predictions per level
-    # ------------------------------------------------------------------
     levels_to_plot = [lvl for lvl in STAT_LEVELS if lvl != "infraspecies"]
     label_taxonomy = load_host_label_taxonomy(truth_paths["label_taxonomy_path"])
     label_index = load_label_index(truth_paths["label_index_path"])
     valid_labels = set(label_index.keys())
 
-    # 1) Ground-truth taxonomy sets per contig + level
     virus_ids: List[str] = []
     gt_tx: Dict[str, Dict[str, Set[str]]] = {}
     try:
@@ -3697,7 +3900,6 @@ def contig_statistics(
 
     virus_id_set = set(virus_ids)
 
-    # 2) Top-1 predicted taxonomy term per contig + level (max score after transfer)
     pred_top1: Dict[str, Dict[str, Tuple[float, str]]] = defaultdict(dict)
     try:
         with open(prediction_path, "r", encoding="utf-8") as fh:
@@ -3728,50 +3930,15 @@ def contig_statistics(
         logger.error(f"Failed to read prediction file {prediction_path}: {exc}")
         return {}
 
-    # ------------------------------------------------------------------
-    # Set up bins
-    # ------------------------------------------------------------------
-    # Default bins; allow user override.
-    if bins:
-        bins = list(bins)
-    else:
-        bins = [0, 20000, 40000, 60000, 80000, float("inf")]
-    if bins[0] > 0:
-        bins = [0.0] + bins
+    bin_pairs, bin_labels = _prepare_contig_length_bins(bins=bins, bin_labels=bin_labels)
 
-    bin_pairs = list(zip(bins[:-1], bins[1:]))
-    bin_labels = [
-        "0-20000",
-        "20000-40000",
-        "40000-60000",
-        "60000-80000",
-        ">80000",
-    ]
-    if len(bin_labels) != len(bin_pairs):
-        bin_labels = [f"{int(lo)}-{int(hi)}" if np.isfinite(hi) else f">{int(lo)}" for lo, hi in bin_pairs]
-
-    def assign_bin(length_val: int) -> Tuple[str, int]:
-        for idx, (lo, hi) in enumerate(bin_pairs):
-            if idx == 0:
-                if length_val <= hi:
-                    return bin_labels[idx], idx
-            elif not np.isfinite(hi):
-                if length_val > lo:
-                    return bin_labels[idx], idx
-            else:
-                if lo < length_val <= hi:
-                    return bin_labels[idx], idx
-        return bin_labels[-1], len(bin_labels) - 1
-
-    # ------------------------------------------------------------------
-    # Aggregate per (level, length_bin): Correct / Incorrect / No-answer
-    # ------------------------------------------------------------------
     counts: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(
         lambda: {"correct": 0, "incorrect": 0, "no_answer": 0}
     )
 
     missing_length = 0
     nonpositive_length = 0
+    above_max_length = 0
 
     for virus_id in virus_ids:
         length_val = length_map.get(virus_id)
@@ -3782,7 +3949,11 @@ def contig_statistics(
             nonpositive_length += 1
             continue
 
-        bin_label, _ = assign_bin(int(length_val))
+        assigned_bin = _assign_contig_length_bin(int(length_val), bin_pairs, bin_labels)
+        if assigned_bin is None:
+            above_max_length += 1
+            continue
+        bin_label, _ = assigned_bin
 
         gt_levels = gt_tx.get(virus_id, {})
         pred_levels = pred_top1.get(virus_id, {})
@@ -3790,7 +3961,7 @@ def contig_statistics(
         for lvl in levels_to_plot:
             gt_set = gt_levels.get(lvl)
             if not gt_set:
-                continue  # consistent with major_plot: only viruses with GT at this level
+                continue
 
             top1 = pred_levels.get(lvl)
             if top1 is None:
@@ -3811,8 +3982,6 @@ def contig_statistics(
             "[contig_statistics] %d contigs have non-positive length; skipped.",
             nonpositive_length
         )
-
-    # Normalise counts into nested dicts with all bins present
     counts_by_level: Dict[str, Dict[str, Dict[str, int]]] = {
         lvl: {
             bin_label: {"correct": 0, "incorrect": 0, "no_answer": 0}
@@ -3824,7 +3993,6 @@ def contig_statistics(
         if lvl in counts_by_level and bin_label in counts_by_level[lvl]:
             counts_by_level[lvl][bin_label].update(c)
 
-    # Precompute Top-1 metrics per level + bin (CR/IR/NA and FDR)
     metrics_by_level: Dict[str, Dict[str, Dict[str, float]]] = {
         lvl: {} for lvl in levels_to_plot
     }
@@ -3852,6 +4020,75 @@ def contig_statistics(
                 "na": na,
                 "fdr": fdr,
             }
+
+    return {
+        "counts_by_level": counts_by_level,
+        "metrics_by_level": metrics_by_level,
+        "levels": levels_to_plot,
+        "bins": bin_labels,
+        "bin_pairs": bin_pairs,
+        "skipped": {
+            "missing_length": missing_length,
+            "nonpositive_length": nonpositive_length,
+            "above_max_length": above_max_length,
+        }
+    }
+
+
+@auto_save_plots
+def contig_statistics(
+    prediction_path: str,
+    truth_paths: Dict[str, str],
+    *,
+    length_path: str,
+    method_name: Optional[str] = None,
+    bins: Optional[List[float]] = None,
+    bin_labels: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Summarise contig-level predictions with length-aware accuracy plots.
+
+    Parameters
+    ----------
+    prediction_path : str
+        TSV file with three columns: contig_id, host_label, score.
+    truth_path : str
+        TSV file with ground-truth host labels (deepest → broadest) per contig.
+    taxonomy_path : str
+        Host taxonomy lookup table (same format used in major_test).
+    length_path : str
+        TSV file mapping contig_id -> length (bp), one per line as
+        "{contig_id}\\t{length}".
+    method_name : str, optional
+        Label for logging/legend purposes.
+    bins : list of float, optional
+        Custom length breakpoints. If None, defaults to:
+        [0, 10000, 20000, 40000, 60000, 80000].
+    bin_labels : list of str, optional
+        Custom labels for the resulting length intervals.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing per-level, per-bin aggregates consistent with
+        the Top-1 metrics used in `major_plot`.
+    """
+    summary = _compute_contig_length_bin_summary(
+        prediction_path=prediction_path,
+        truth_paths=truth_paths,
+        length_path=length_path,
+        method_name=method_name,
+        bins=bins,
+        bin_labels=bin_labels,
+    )
+    if not summary:
+        return {}
+
+    counts_by_level = summary["counts_by_level"]
+    metrics_by_level = summary["metrics_by_level"]
+    levels_to_plot = summary["levels"]
+    bin_labels = summary["bins"]
+    bin_pairs = summary["bin_pairs"]
+    skipped = summary["skipped"]
 
     # ------------------------------------------------------------------
     # Plot 1: length × taxonomy-level grid (stacked proportions)
@@ -4035,15 +4272,645 @@ def contig_statistics(
         "metrics_by_level": metrics_by_level,
         "levels": levels_to_plot,
         "bins": bin_labels,
-        "skipped": {
-            "missing_length": missing_length,
-            "nonpositive_length": nonpositive_length,
-        }
+        "skipped": skipped,
     }
 
     return summary
 
 contig_statistics._default_save_prefix = 'Contig_Statistics'
+
+
+def imgvr_length_stratified_cr_ir_na_table(
+    method_prediction_paths: Optional[Dict[str, str]] = None,
+    truth_paths: Optional[Dict[str, str]] = None,
+    *,
+    length_path: str = "vhseek_data/data/img_vr/virus_length",
+    output_filename: str = "IMG_VR_Length_Stratified_CR_IR_NA.tsv",
+    bins: Optional[List[float]] = None,
+    bin_labels: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Export IMG/VR length-stratified Top-1 CR/IR/NA for VHSeek variants.
+
+    The function reuses the same length-bin summary helper as
+    `contig_statistics`, but only writes the source TSV and does not create any
+    figures.
+    """
+    method_prediction_paths = method_prediction_paths or IMGVR_LENGTH_STRATIFIED_METHODS
+    truth_paths = truth_paths or IMGVR_LENGTH_STRATIFIED_TRUTH_PATHS
+    bins = bins or IMGVR_LENGTH_STRATIFIED_BINS
+    bin_labels = bin_labels or IMGVR_LENGTH_STRATIFIED_BIN_LABELS
+
+    rows: List[Dict[str, Any]] = []
+    for method, prediction_path in method_prediction_paths.items():
+        summary = _compute_contig_length_bin_summary(
+            prediction_path=prediction_path,
+            truth_paths=truth_paths,
+            length_path=length_path,
+            method_name=method,
+            bins=bins,
+            bin_labels=bin_labels,
+        )
+        if not summary:
+            raise RuntimeError(f"Failed to compute IMG/VR length-stratified table for {method}")
+
+        for level in summary["levels"]:
+            for length_bin in summary["bins"]:
+                metrics = summary["metrics_by_level"][level][length_bin]
+                valid_viruses = int(metrics["total"])
+                rows.append({
+                    "method": method,
+                    "level": level,
+                    "length_bin": length_bin,
+                    "valid_viruses": valid_viruses,
+                    "correct": int(metrics["correct"]),
+                    "incorrect": int(metrics["incorrect"]),
+                    "no_answer": int(metrics["no_answer"]),
+                    "CR": round(float(metrics["cr"]), 3) if valid_viruses else np.nan,
+                    "IR": round(float(metrics["ir"]), 3) if valid_viruses else np.nan,
+                    "NA": round(float(metrics["na"]), 3) if valid_viruses else np.nan,
+                })
+
+    columns = [
+        "method",
+        "level",
+        "length_bin",
+        "valid_viruses",
+        "correct",
+        "incorrect",
+        "no_answer",
+        "CR",
+        "IR",
+        "NA",
+    ]
+    df = pd.DataFrame(rows, columns=columns)
+    _write_tsv(df, output_filename, index=False, float_format="%.3f")
+    df.attrs["output_path"] = str(_TSV_DIR / output_filename)
+    logger.info("Saved IMG/VR length-stratified CR/IR/NA table to %s", df.attrs["output_path"])
+    return df
+
+
+HGP_METAHIC_RANKS: List[str] = ["species", "genus", "family", "order", "class", "phylum"]
+HGP_METAHIC_LENGTH_BINS: List[Tuple[str, int, Optional[int]]] = [
+    ("<=5kb", 0, 5000),
+    ("5-10kb", 5000, 10000),
+    ("10-20kb", 10000, 20000),
+    (">20kb", 20000, None),
+]
+HGP_METAHIC_LABEL_TRANSFER_HEADER_RE = re.compile(r"^\[(.+)\]\[(.+)\]$")
+
+
+def _hgp_metahic_normalize_taxon(value: Any) -> str:
+    value = str(value or "").strip()
+    if not value or value == "NA" or value == "_":
+        return ""
+    if "__" in value:
+        value = value.split("__", 1)[1]
+    value = value.replace("_", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.lower()
+
+
+def _hgp_metahic_parse_int(value: Any) -> Optional[int]:
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _hgp_metahic_length_bin(value: Any) -> str:
+    length = _hgp_metahic_parse_int(value)
+    if length is None:
+        return "missing"
+    for label, lower, upper in HGP_METAHIC_LENGTH_BINS:
+        if upper is None:
+            if length > lower:
+                return label
+        elif lower < length <= upper:
+            return label
+    return "missing"
+
+
+def _hgp_metahic_load_taxonomy_namespace(path: Path) -> Dict[str, Set[str]]:
+    namespace: Dict[str, Set[str]] = {rank: set() for rank in HGP_METAHIC_RANKS}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            for rank in HGP_METAHIC_RANKS:
+                taxon = _hgp_metahic_normalize_taxon(row.get(rank, ""))
+                if taxon:
+                    namespace[rank].add(taxon)
+    return namespace
+
+
+def _hgp_metahic_load_harmonization_map(path: Path) -> Dict[Tuple[str, str], str]:
+    harmonization_map: Dict[Tuple[str, str], str] = {}
+    if not path.exists():
+        return harmonization_map
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            rank = row.get("rank", "")
+            hgp_norm = _hgp_metahic_normalize_taxon(row.get("hgp_name", ""))
+            vhseek_norm = _hgp_metahic_normalize_taxon(row.get("vhseek_name", ""))
+            if not rank or not hgp_norm or not vhseek_norm:
+                continue
+            harmonization_map[(rank, hgp_norm)] = vhseek_norm
+            harmonization_map[(rank, vhseek_norm)] = vhseek_norm
+    return harmonization_map
+
+
+def _hgp_metahic_canonical_taxon(
+    value: Any,
+    rank: str,
+    harmonization_map: Dict[Tuple[str, str], str],
+) -> str:
+    norm = _hgp_metahic_normalize_taxon(value)
+    return harmonization_map.get((rank, norm), norm)
+
+
+def _hgp_metahic_parse_label_transfer(path: Path) -> Dict[str, Dict[str, Tuple[str, float]]]:
+    predictions: Dict[str, Dict[str, Tuple[str, float]]] = defaultdict(dict)
+    current_virus = ""
+    current_rank = ""
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            match = HGP_METAHIC_LABEL_TRANSFER_HEADER_RE.match(line)
+            if match:
+                current_virus, current_rank = match.group(1), match.group(2)
+                continue
+            if current_virus and current_rank in HGP_METAHIC_RANKS:
+                if current_rank in predictions[current_virus]:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                try:
+                    score = float(parts[1])
+                except ValueError:
+                    score = float("nan")
+                predictions[current_virus][current_rank] = (parts[0], score)
+    return predictions
+
+
+def _hgp_metahic_build_rows(source_table: Path, sequence_audit: Path) -> List[Dict[str, Any]]:
+    source_rows = pd.read_csv(source_table, sep="\t", dtype=str).fillna("")
+    audit_rows = pd.read_csv(sequence_audit, sep="\t", dtype=str).fillna("")
+    audit_by_virus = {
+        row["virus_id"]: row
+        for row in audit_rows.to_dict("records")
+    }
+    rows: List[Dict[str, Any]] = []
+    for source_row in source_rows.to_dict("records"):
+        audit_row = audit_by_virus.get(source_row["virus_id"], {})
+        output: Dict[str, Any] = {
+            "virus_id": source_row["virus_id"],
+            "found_sequence": str(audit_row.get("found_sequence", "")),
+            "sequence_length": audit_row.get("sequence_length", ""),
+        }
+        for rank in HGP_METAHIC_RANKS:
+            output[f"host_{rank}"] = source_row.get(f"host_{rank}", "")
+        rows.append(output)
+    return rows
+
+
+def _hgp_metahic_policy_metrics(
+    rows: List[Dict[str, Any]],
+    predictions: Dict[str, Dict[str, Tuple[str, float]]],
+    namespace: Dict[str, Set[str]],
+    harmonization_map: Dict[Tuple[str, str], str],
+    *,
+    method: str,
+    matching_policy: str,
+    length_bin: Optional[str] = None,
+    threshold: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    if length_bin is not None:
+        scoped_rows = [
+            row for row in rows
+            if _hgp_metahic_length_bin(row.get("sequence_length", "")) == length_bin
+        ]
+    else:
+        scoped_rows = rows
+
+    policy_map = harmonization_map if matching_policy == "synonym-aware" else {}
+    output: List[Dict[str, Any]] = []
+    for rank in HGP_METAHIC_RANKS:
+        valid_rows = [
+            row for row in scoped_rows
+            if row.get("found_sequence") == "1" and row.get(f"host_{rank}", "")
+        ]
+        exact_rows = [
+            row for row in valid_rows
+            if _hgp_metahic_canonical_taxon(row.get(f"host_{rank}", ""), rank, {})
+            in namespace[rank]
+        ]
+        synonym_rows = [
+            row for row in valid_rows
+            if _hgp_metahic_canonical_taxon(row.get(f"host_{rank}", ""), rank, harmonization_map)
+            in namespace[rank]
+        ]
+        comparable_rows = synonym_rows if matching_policy == "synonym-aware" else exact_rows
+
+        correct = incorrect = no_answer = 0
+        lengths: List[int] = []
+        for row in comparable_rows:
+            length = _hgp_metahic_parse_int(row.get("sequence_length", ""))
+            if length is not None:
+                lengths.append(length)
+
+            prediction = predictions.get(row["virus_id"], {}).get(rank)
+            if not prediction:
+                no_answer += 1
+                continue
+
+            predicted_taxon, _score = prediction
+            reference_taxon = row.get(f"host_{rank}", "")
+            if (
+                _hgp_metahic_canonical_taxon(reference_taxon, rank, policy_map)
+                == _hgp_metahic_canonical_taxon(predicted_taxon, rank, policy_map)
+            ):
+                correct += 1
+            else:
+                incorrect += 1
+
+        denominator = len(comparable_rows)
+        answered = correct + incorrect
+        cr = correct / denominator if denominator else np.nan
+        ir = incorrect / denominator if denominator else np.nan
+        na = no_answer / denominator if denominator else np.nan
+        fdr = incorrect / answered if answered else np.nan
+
+        row_out: Dict[str, Any] = {
+            "dataset": "HGP/MetaHiC Hi-C ORF-derived",
+            "matching_policy": matching_policy,
+            "method": method,
+            "level": rank,
+            "valid_records": len(valid_rows),
+            "exact_name_records": len(exact_rows),
+            "synonym_aware_records": len(synonym_rows) if matching_policy == "synonym-aware" else np.nan,
+            "correct": correct,
+            "incorrect": incorrect,
+            "no_answer": no_answer,
+            "CR": round(float(cr), 3) if denominator else np.nan,
+            "IR": round(float(ir), 3) if denominator else np.nan,
+            "NA": round(float(na), 3) if denominator else np.nan,
+            "TPR": round(float(cr), 3) if denominator else np.nan,
+            "FDR": round(float(fdr), 3) if answered else np.nan,
+            "threshold": threshold if threshold is not None else np.nan,
+        }
+        if matching_policy == "exact-name":
+            row_out["synonym_aware_records"] = np.nan
+        if length_bin is not None:
+            row_out["length_bin"] = length_bin
+            row_out["median_contig_length"] = (
+                round(float(statistics.median(lengths)), 3) if lengths else np.nan
+            )
+        output.append(row_out)
+    return output
+
+
+def _hgp_metahic_assert_policy_metrics(df: pd.DataFrame) -> None:
+    for row in df.to_dict("records"):
+        denominator_col = (
+            "synonym_aware_records"
+            if row["matching_policy"] == "synonym-aware"
+            else "exact_name_records"
+        )
+        denominator = int(row[denominator_col])
+        correct = int(row["correct"])
+        incorrect = int(row["incorrect"])
+        no_answer = int(row["no_answer"])
+        if correct + incorrect + no_answer != denominator:
+            raise AssertionError(f"HGP/MetaHiC ORF-derived count invariant failed for {row}")
+        if denominator:
+            total = float(row["CR"]) + float(row["IR"]) + float(row["NA"])
+            if abs(total - 1.0) > 0.002:
+                raise AssertionError(f"HGP/MetaHiC ORF-derived CR/IR/NA invariant failed for {row}")
+
+
+def hgp_metahic_hic_orf_derived_metrics_table(
+    data_root: str = "vhseek_data/experiment/test_result/notebook/data/HGP_MetaHiC_HiC_ORF_Derived",
+    output_prefix: str = "HGP_MetaHiC_HiC",
+    *,
+    taxonomy_path: str = "vhseek_data/data/util/host_label/label_transfer/taxonomy",
+    threshold: float = 0.835,
+) -> Dict[str, pd.DataFrame]:
+    """Export final HGP/MetaHiC ORF-derived four-variant source tables.
+
+    This table-only helper starts from staged source metadata, taxonomy
+    harmonization inputs, ORF coverage tables, and completed label-transfer
+    outputs. It does not run ORF callers, generate embeddings, or perform
+    VHSeek inference.
+    """
+    root = Path(data_root)
+    input_root = root / "input"
+    source_table = input_root / "hgp_hic_source_table.tsv"
+    sequence_audit = input_root / "hgp_hic_sequence_extraction_audit.tsv"
+    harmonization_map_path = input_root / "hgp_hic_taxonomy_harmonization_map.tsv"
+    coverage_summary_path = input_root / "hgp_hic_orf_coverage_summary.tsv"
+    coverage_by_length_path = input_root / "hgp_hic_orf_coverage_by_length.tsv"
+    coverage_by_contig_path = input_root / "hgp_hic_orf_coverage_by_contig.tsv"
+    method_inputs: List[Tuple[str, Path, Optional[float]]] = [
+        ("VHSeek (AIDO-300M)", input_root / "vhseek_aido_300_label_transfer", None),
+        ("VHSeek (ESM2-650M)", input_root / "vhseek_esm2_650_label_transfer", None),
+        ("VHSeek", input_root / "vhseek_full_label_transfer", None),
+        (
+            "VHSeek (Threshold)",
+            input_root / "vhseek_full_threshold_0_835_label_transfer",
+            threshold,
+        ),
+    ]
+
+    required_paths = [
+        source_table,
+        sequence_audit,
+        harmonization_map_path,
+        coverage_summary_path,
+        coverage_by_length_path,
+        coverage_by_contig_path,
+        Path(taxonomy_path),
+        *[label_transfer_path for _method, label_transfer_path, _threshold in method_inputs],
+    ]
+    for path in required_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Required HGP/MetaHiC ORF-derived input not found: {path}")
+
+    rows = _hgp_metahic_build_rows(source_table, sequence_audit)
+    namespace = _hgp_metahic_load_taxonomy_namespace(Path(taxonomy_path))
+    harmonization_map = _hgp_metahic_load_harmonization_map(harmonization_map_path)
+
+    rank_rows: List[Dict[str, Any]] = []
+    length_rows: List[Dict[str, Any]] = []
+    for matching_policy in ["exact-name", "synonym-aware"]:
+        for method_name, label_transfer_path, method_threshold in method_inputs:
+            predictions = _hgp_metahic_parse_label_transfer(label_transfer_path)
+            rank_rows.extend(
+                _hgp_metahic_policy_metrics(
+                    rows,
+                    predictions,
+                    namespace,
+                    harmonization_map,
+                    method=method_name,
+                    matching_policy=matching_policy,
+                    threshold=method_threshold,
+                )
+            )
+            for length_label, _lower, _upper in HGP_METAHIC_LENGTH_BINS:
+                length_rows.extend(
+                    _hgp_metahic_policy_metrics(
+                        rows,
+                        predictions,
+                        namespace,
+                        harmonization_map,
+                        method=method_name,
+                        matching_policy=matching_policy,
+                        length_bin=length_label,
+                        threshold=method_threshold,
+                    )
+                )
+
+    rank_columns = [
+        "dataset",
+        "matching_policy",
+        "method",
+        "level",
+        "valid_records",
+        "exact_name_records",
+        "synonym_aware_records",
+        "correct",
+        "incorrect",
+        "no_answer",
+        "CR",
+        "IR",
+        "NA",
+        "TPR",
+        "FDR",
+        "threshold",
+    ]
+    length_columns = [
+        "dataset",
+        "matching_policy",
+        "method",
+        "length_bin",
+        "level",
+        "valid_records",
+        "exact_name_records",
+        "synonym_aware_records",
+        "correct",
+        "incorrect",
+        "no_answer",
+        "CR",
+        "IR",
+        "NA",
+        "TPR",
+        "FDR",
+        "threshold",
+        "median_contig_length",
+    ]
+    rank_df = pd.DataFrame(rank_rows, columns=rank_columns)
+    length_df = pd.DataFrame(length_rows, columns=length_columns)
+    map_df = pd.read_csv(harmonization_map_path, sep="\t")
+    coverage_summary_df = pd.read_csv(coverage_summary_path, sep="\t")
+    coverage_by_length_df = pd.read_csv(coverage_by_length_path, sep="\t")
+    coverage_by_contig_df = pd.read_csv(coverage_by_contig_path, sep="\t")
+
+    _hgp_metahic_assert_policy_metrics(rank_df)
+    _hgp_metahic_assert_policy_metrics(length_df)
+
+    outputs: Dict[str, Tuple[pd.DataFrame, str]] = {
+        "rank_level": (rank_df, f"{output_prefix}_Rank_Level_Metrics.tsv"),
+        "length_stratified": (length_df, f"{output_prefix}_Length_Stratified_Metrics.tsv"),
+        "orf_coverage_summary": (
+            coverage_summary_df,
+            f"{output_prefix}_ORF_Coverage_Summary.tsv",
+        ),
+        "orf_coverage_by_length": (
+            coverage_by_length_df,
+            f"{output_prefix}_ORF_Coverage_By_Length.tsv",
+        ),
+        "orf_coverage_by_contig": (
+            coverage_by_contig_df,
+            f"{output_prefix}_ORF_Coverage_By_Contig.tsv",
+        ),
+        "taxonomy_harmonization_map": (
+            map_df,
+            f"{output_prefix}_Taxonomy_Harmonization_Map.tsv",
+        ),
+    }
+    result: Dict[str, pd.DataFrame] = {}
+    for name, (df, filename) in outputs.items():
+        _write_tsv(df, filename, index=False, float_format="%.3f")
+        df.attrs["output_path"] = str(_TSV_DIR / filename)
+        result[name] = df
+
+    logger.info("Saved HGP/MetaHiC ORF-derived source tables with prefix %s", output_prefix)
+    return result
+
+
+ORF_CALLER_SENSITIVITY_POLICIES: List[Tuple[str, str]] = [
+    ("source_protein", "source protein, no new ORF caller"),
+    ("prodigal", "Prodigal"),
+    ("prodigal_gv", "Prodigal-gv"),
+    ("phanotate", "PHANOTATE"),
+]
+
+
+def _count_orfs_by_virus_from_fasta(fasta_path: Path) -> Tuple[int, int, int]:
+    counts: Counter = Counter()
+    with fasta_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith(">"):
+                continue
+            header = line[1:].strip()
+            if not header:
+                continue
+            virus_name = get_virus_name(header)
+            counts[virus_name] += 1
+
+    if not counts:
+        raise ValueError(f"No FASTA records found in {fasta_path}")
+
+    per_virus = list(counts.values())
+    return len(counts), int(sum(per_virus)), int(statistics.median(per_virus))
+
+
+def _merge_embedding_pickles_strict(
+    dna_embedding_path: Path,
+    protein_embedding_path: Path,
+    output_path: Path,
+) -> int:
+    dna_embedding = load_embeddings(str(dna_embedding_path))
+    protein_embedding = load_embeddings(str(protein_embedding_path))
+
+    dna_keys = set(dna_embedding)
+    protein_keys = set(protein_embedding)
+    if dna_keys != protein_keys:
+        missing_dna = sorted(protein_keys - dna_keys)[:10]
+        missing_protein = sorted(dna_keys - protein_keys)[:10]
+        raise ValueError(
+            "Embedding key mismatch while merging ORF sensitivity inputs. "
+            f"Missing DNA count={len(protein_keys - dna_keys)}, examples={missing_dna}; "
+            f"missing protein count={len(dna_keys - protein_keys)}, examples={missing_protein}."
+        )
+
+    merged: Dict[str, torch.Tensor] = {}
+    for virus_name in protein_embedding:
+        protein_vec = protein_embedding[virus_name]
+        dna_vec = dna_embedding[virus_name]
+        if protein_vec.dim() != 1 or dna_vec.dim() != 1:
+            raise ValueError(f"Embedding for {virus_name} is not a 1D tensor.")
+        merged[virus_name] = torch.cat([protein_vec, dna_vec], dim=0)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as handle:
+        pickle.dump(merged, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    return len(merged)
+
+
+def _import_vhseek_test_function():
+    try:
+        from vhseek.vhseek_test import vhseek_test
+    except Exception:
+        from vhseek_test import vhseek_test
+    return vhseek_test
+
+
+def orf_caller_sensitivity_table(
+    data_root: str = "vhseek_data/experiment/test_result/notebook/data/ORF_Caller_Sensitivity",
+    output_filename: str = "ORF_Caller_Sensitivity_Source_Protein.tsv",
+    *,
+    model_path: str = "vhseek_data/model/vhseek/iphop/vhseek",
+    label_index_path: str = "vhseek_data/data/util/host_label/label_transfer/index",
+    label_taxonomy_path: str = "vhseek_data/data/util/host_label/label_transfer/taxonomy",
+    taxonomy_index_path: str = "vhseek_data/data/util/host_label/label_transfer/index",
+    virus_test_path: str = "vhseek_data/data/iphop/label_transfer/test",
+) -> pd.DataFrame:
+    """Re-run ORF-caller sensitivity from staged notebook inputs.
+
+    This table-only helper starts from precomputed FASTA files and virus-level
+    DNA/protein embeddings staged under `notebook/data`. It merges embeddings,
+    runs the same iPHoP full VHSeek model for each protein-input policy, and
+    writes the notebook source TSV. It does not run ORF callers or regenerate
+    AIDO/ESM embeddings.
+    """
+    root = Path(data_root)
+    input_root = root / "input"
+    fasta_root = input_root / "fastas"
+    embedding_root = input_root / "embeddings"
+    work_root = root / "work"
+    rows: List[Dict[str, Any]] = []
+    vhseek_test = _import_vhseek_test_function()
+
+    for policy_key, policy_label in ORF_CALLER_SENSITIVITY_POLICIES:
+        fasta_path = fasta_root / f"{policy_key}.faa"
+        dna_embedding_path = embedding_root / policy_key / "virus_aido_300.pkl"
+        protein_embedding_path = embedding_root / policy_key / "virus_esm2_650.pkl"
+        for path in (fasta_path, dna_embedding_path, protein_embedding_path):
+            if not path.exists():
+                raise FileNotFoundError(f"Required ORF sensitivity input not found: {path}")
+
+        viruses, total_orfs, median_orfs = _count_orfs_by_virus_from_fasta(fasta_path)
+        merged_embedding_path = work_root / "merged_embeddings" / policy_key / "virus_full.pkl"
+        merged_viruses = _merge_embedding_pickles_strict(
+            dna_embedding_path=dna_embedding_path,
+            protein_embedding_path=protein_embedding_path,
+            output_path=merged_embedding_path,
+        )
+        if merged_viruses != viruses:
+            raise ValueError(
+                f"{policy_key} has {viruses} viruses in FASTA but {merged_viruses} merged embeddings."
+            )
+
+        prediction_dir = work_root / "predictions" / policy_key
+        prediction_dir.mkdir(parents=True, exist_ok=True)
+        result = vhseek_test(
+            model_path=model_path,
+            embedding_path=str(merged_embedding_path),
+            label_index_path=label_index_path,
+            label_taxonomy_path=label_taxonomy_path,
+            taxonomy_index_path=taxonomy_index_path,
+            virus_test_path=virus_test_path,
+            top=10,
+            threshold=None,
+            output_path=str(prediction_dir),
+        )
+
+        rows.append({
+            "protein_input_policy": policy_label,
+            "fmax": round(float(result["fmax_per_level"]["genus"]), 3),
+            "aupr": round(float(result["aupr_per_level"]["genus"]), 3),
+            "genus_cr": round(float(result["cr_per_level"]["genus"]), 3),
+            "genus_ir": round(float(result["ir_per_level"]["genus"]), 3),
+            "genus_na": round(float(result["na_per_level"]["genus"]), 3),
+            "viruses": viruses,
+            "total_orfs": total_orfs,
+            "median_orfs_per_virus": median_orfs,
+        })
+
+    columns = [
+        "protein_input_policy",
+        "fmax",
+        "aupr",
+        "genus_cr",
+        "genus_ir",
+        "genus_na",
+        "viruses",
+        "total_orfs",
+        "median_orfs_per_virus",
+    ]
+    df = pd.DataFrame(rows, columns=columns)
+    _write_tsv(df, output_filename, index=False, float_format="%.3f")
+    df.attrs["output_path"] = str(_TSV_DIR / output_filename)
+    logger.info("Saved ORF caller sensitivity table to %s", df.attrs["output_path"])
+    return df
 
 
 @auto_save_plots
